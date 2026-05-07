@@ -1,0 +1,118 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper Primitives
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    
+    // Project Helpers
+    function getProject(projectId) {
+      return get(/databases/$(database)/documents/projects/$(projectId)).data;
+    }
+    function isProjectAdmin(projectId) {
+      return isSignedIn() && getProject(projectId).adminId == request.auth.uid;
+    }
+    function isProjectMember(projectId) {
+      return isSignedIn() && request.auth.uid in getProject(projectId).members;
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['name', 'email', 'role', 'createdAt']) &&
+               data.keys().size() == 4 &&
+               data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+               data.email is string && data.email == request.auth.token.email &&
+               data.role in ['admin', 'member'] &&
+               data.createdAt == request.time;
+      }
+
+      allow get: if isSignedIn() && (request.auth.uid == userId || isProjectMemberShared(request.auth.uid));
+      // Simplified: Allow user to read their own or others if sharing a project
+      // For now, let's just allow reading any user profile if signed in for invitation purposes
+      allow read: if isSignedIn(); 
+      
+      allow create: if isVerified() && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isVerified() && request.auth.uid == userId && 
+                    incoming().diff(existing()).affectedKeys().hasOnly(['name']) &&
+                    incoming().name is string && incoming().name.size() <= 100;
+    }
+
+    // Projects Collection
+    match /projects/{projectId} {
+      function isValidProject(data) {
+        return data.keys().hasAll(['name', 'adminId', 'members', 'createdAt']) &&
+               data.keys().size() >= 4 &&
+               data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+               data.adminId == request.auth.uid &&
+               data.members is list && data.members.size() > 0 && data.members[0] == request.auth.uid &&
+               data.createdAt == request.time;
+      }
+
+      allow list: if isVerified() && request.auth.uid in resource.data.members;
+      allow get: if isVerified() && request.auth.uid in resource.data.members;
+      
+      allow create: if isVerified() && isValidId(projectId) && isValidProject(incoming());
+      
+      allow update: if isVerified() && (
+        // Admin Action: Edit Project or Manage Members
+        (isProjectAdmin(projectId) && 
+         incoming().diff(existing()).affectedKeys().hasAny(['name', 'description', 'members', 'color']) &&
+         incoming().adminId == existing().adminId &&
+         incoming().createdAt == existing().createdAt) 
+      );
+      
+      allow delete: if isVerified() && isProjectAdmin(projectId);
+
+      // Tasks Subcollection
+      match /tasks/{taskId} {
+        function isValidTask(data) {
+          return data.keys().hasAll(['title', 'projectId', 'priority', 'status', 'creatorId', 'createdAt', 'updatedAt']) &&
+                 data.title is string && data.title.size() > 0 && data.title.size() <= 200 &&
+                 data.projectId == projectId &&
+                 data.priority in ['low', 'medium', 'high'] &&
+                 data.status in ['todo', 'in_progress', 'done'] &&
+                 data.creatorId == request.auth.uid &&
+                 data.createdAt == request.time &&
+                 data.updatedAt == request.time;
+        }
+
+        allow read, list: if isVerified() && isProjectMember(projectId);
+        
+        allow create: if isVerified() && isProjectAdmin(projectId) && isValidTask(incoming());
+        
+        allow update: if isVerified() && (
+          // Admin can update anything except immutable fields
+          (isProjectAdmin(projectId) && 
+           incoming().creatorId == existing().creatorId &&
+           incoming().createdAt == existing().createdAt &&
+           incoming().updatedAt == request.time) ||
+          
+          // Member can only update 'status' of tasks assigned to them
+          (isProjectMember(projectId) && existing().assignedTo == request.auth.uid &&
+           incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+           incoming().status in ['todo', 'in_progress', 'done'] &&
+           incoming().updatedAt == request.time)
+        );
+        
+        allow delete: if isVerified() && isProjectAdmin(projectId);
+      }
+
+      // Activity Logs
+      match /logs/{logId} {
+        allow read: if isVerified() && isProjectMember(projectId);
+        allow create: if isVerified() && isProjectMember(projectId) &&
+                      incoming().userId == request.auth.uid &&
+                      incoming().timestamp == request.time;
+      }
+    }
+  }
+}
